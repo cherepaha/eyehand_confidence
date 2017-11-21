@@ -39,28 +39,14 @@ class DataPreprocessor:
 #        dynamics['mouse_v'] = np.sqrt(dynamics.mouse_vx**2 + dynamics.mouse_vy**2 )
 #        dynamics['eye_v'] = np.sqrt(dynamics.eye_vx**2 + dynamics.eye_vy**2 )        
                           
-        return dynamics
-
-    def drop_excluded_trials(self, choices, dynamics, trials):
-        choices = choices.drop(trials, errors='ignore')
-        
-        # NB: this is a hack to deal with (supposedly) pandas bug.
-        # When multiindex values are not unique (as in dynamics dataframes), 
-        # drop doesn't really work, so we have to remove trials one-by-one
-        dynamics = dynamics.reset_index()
-        for trial in trials:
-            dynamics = dynamics[~((dynamics.subj_id==trial[0]) & (dynamics.session_no==trial[1]) & 
-                                  (dynamics.block_no==trial[2]) & (dynamics.trial_no==trial[3]))]
-        dynamics = dynamics.set_index(self.index, drop=True)
-        
-        return choices, dynamics        
+        return dynamics  
     
     def get_mouse_and_gaze_measures(self, choices, dynamics, stim_viewing):
         choices['is_correct'] = choices['direction'] == choices['response']
         choices.response_time /= 1000.0
         choices.gamble_time /= 1000.0
         choices['xflips'] = dynamics.groupby(level=self.index).\
-                                    apply(lambda traj: self.zero_cross_count(traj.mouse_vx))    
+                                    apply(lambda traj: self.zero_cross_count(traj.mouse_vx.values)) 
         choices = choices.join(dynamics.groupby(level=self.index).apply(self.get_maxd))
         choices = choices.join(dynamics.groupby(level=self.index).apply(self.get_midline_d))
         choices['is_com'] = ((choices.midline_d > self.com_threshold_x) & \
@@ -71,15 +57,12 @@ class DataPreprocessor:
         # maybe we can call it gaze latency
         # but mouse initiation time is basically undefined
         # what we have here is total time it takes until decision is executed
-#        choices = choices.join(dynamics.groupby(level=self.index).apply(self.get_mouse_IT))
-#        choices = choices.join(dynamics.groupby(level=self.index).apply(self.get_eye_IT))                       
-#        choices['ID_lag'] = choices.mouse_IT - choices.eye_IT
-        
+
         # We can also z-score within participant AND coherence level, the results remain the same
-        # ['subj_id', 'coherence']
+        z_groups = ['subj_id']
         z_columns = ['response_time', 'gamble_value', 'gamble_time', 'max_d', 'xflips']
         for col in z_columns:
-            choices[col + '_zscore'] = choices[col].groupby(level='subj_id'). \
+            choices[col + '_zscore'] = choices[col].groupby(level=z_groups). \
                                         apply(lambda c: (c-c.mean())/c.std())        
         return choices
     
@@ -123,17 +106,8 @@ class DataPreprocessor:
         mouse_x = traj.mouse_x.values
         is_final_point_positive = (mouse_x[-1]>0)
         
-#        if is_final_point_positive:
-#            midline_d = abs(mouse_x.min())
-##            idx_midline_d = int(mouse_x.argmin())
-#        else:
-#            midline_d = abs(mouse_x.max())
-##            idx_midline_d = int(mouse_x.argmax())
         midline_d = mouse_x.min() if is_final_point_positive else mouse_x.max()
-#        print(traj)
-#        print(midline_d)
-#        print(abs(mouse_x.argmin()) if is_final_point_positive else abs(mouse_x.argmax()))
-#        print((mouse_x == midline_d).nonzero())
+
         idx_midline_d = (mouse_x == midline_d).nonzero()[0][-1]
         midline_d_y = traj.mouse_y.values[idx_midline_d]
         return pd.Series({'midline_d': abs(midline_d), 
@@ -141,72 +115,8 @@ class DataPreprocessor:
                           'midline_d_y': midline_d_y})
 
     def zero_cross_count(self, x):
-        return (abs(np.diff(np.sign(x))) > 1).sum()
-
-    def get_mouse_IT(self, traj):
-        v = traj.mouse_v.values
-    
-        onsets = []
-        offsets = []
-        is_previous_v_zero = True
-    
-        for i in np.arange(0,len(v)):
-            if v[i]!=0:
-                if is_previous_v_zero:
-                    is_previous_v_zero = False
-                    onsets += [i]
-                elif (i==len(v)-1):
-                    offsets += [i]            
-            elif (not is_previous_v_zero):
-                offsets += [i]
-                is_previous_v_zero = True
-    
-        submovements = pd.DataFrame([{'on': onsets[i], 
-                 'off': offsets[i], 
-                 'on_t': traj.timestamp.values[onsets[i]],
-                 'distance':(traj.mouse_v[onsets[i]:offsets[i]]*
-                             traj.timestamp.diff()[onsets[i]:offsets[i]]).sum()}
-                for i in range(len(onsets))])
-    
-        it = submovements.loc[submovements.distance.ge(self.it_distance_threshold ).idxmax()].on_t
-        return pd.Series({'mouse_IT': it, 'motion_time': traj.timestamp.max()-it})
-
-    def get_eye_IT(self, traj):        
-        v = traj.eye_v
-        if ((v < self.eye_v_threshold) | (v.isnull())).all():
-            # if eye stays at one location throughout the whole trial, 
-            # it is supposedly fixated either at the center of the screen, or at the response location
-            # in the former case, initation time is inf, in the latter case, initation time is 0
-            # we detect which case is tru  by looking at first value of eye_x
-            if abs(traj.eye_x.iloc[0]) < 100: 
-                eye_IT = np.inf
-                eye_initial_decision = 0
-            else:
-                eye_IT = 0
-                eye_initial_decision = np.sign(traj.eye_x.iloc[0])
-        else:
-            eye_IT_idx = (v > self.eye_v_threshold).nonzero()[0][0]
-            eye_IT = traj.timestamp.iloc[eye_IT_idx]
-            eye_initial_decision = np.sign(traj.eye_x.iloc[eye_IT_idx+1])
-        
-        return pd.Series({'eye_IT': eye_IT, 'eye_initial_decision': eye_initial_decision})
-
-    def get_stim_mouse_IT(self, stim_traj):
-        t = stim_traj.timestamp.values
-        v = stim_traj.mouse_v.values
-        if v[-1]:
-            idx = np.where(v==0)[0][-1]+1 if len(v[v==0]) else 0
-            IT = (t[idx] - t.max())
-        else:
-            IT = 0
-        return IT
-    
-    def get_stim_eye_IT(self, stim_traj):
-        t = stim_traj.timestamp.values
-        v = stim_traj.eye_v.values
-    
-        idx = np.where(v<self.eye_v_threshold)[0][-1] if len(v[v<self.eye_v_threshold]) else 0
-        return (t[idx] - t.max())
+        return (abs(np.diff(np.sign(x)[np.nonzero(np.sign(x))]))>1).sum()
+#        return (abs(np.diff(np.sign(x))) > 1).sum()
     
     def resample_trajectory(self, traj, n_steps):
         # Make the sampling time intervals regular
